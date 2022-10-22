@@ -1,4 +1,4 @@
-#define DEBUG
+//#define DEBUG
 #include <Arduino.h>
 
 #ifdef DEBUG
@@ -9,153 +9,213 @@
   #define Sprint(x)     Serial.print (x)
   #define Sprintdec(x)  Serial.print (x, DEC)
   #define Sprintln(x)   Serial.println (x)
-  // serial port used for debug communication -> use software serial for beamer
+  // serial port used for debug communication -> use software serial for projector
   #include <SoftwareSerial.h>
-  SoftwareSerial beamSerial(8, 7); // Arduino RX, Arduino TX
+  SoftwareSerial projector_serial(7, 8); // Arduino RX, Arduino TX
   //debouncing for debug btn in milliS
-  const long debouncingTime = 15;
-  volatile unsigned long lastPressed = 0;
+  const long debouncing_time = 15;
+  volatile unsigned long last_keypress = 0;
 #else
   // input: just digital switch
-  #define INPUT_I 2
-  #define INPUT_II 3
+  #define INPUT_I 3
+  #define INPUT_II 4
   #define Sprint(x)
   #define Sprintdec(x)
   #define Sprintln(x)
-  // #define beamSerial Serial
+  #define projector_serial Serial
 #endif
 
 // switch state
 const byte STATE_OFF = 0;
 const byte STATE_DISPLAY = 1;
-const byte STATE_BEAMER = 2;
+const byte STATE_PROJECTOR = 2;
 // transitions
 const byte TRANS_NONE = 0;
 const byte TRANS_OFF = 1;
-const byte TRANS_BEAMER = 2;
-// outputs: light while on & motor to shut door
-const byte OUTPUT_DISPLAY = 12; //red
-const byte OUTPUT_BEAMER = 11; //green
-// beamer protocol
+const byte TRANS_PROJECTOR = 2;
+// outputs: react to state by signal light, motor to shut door etc
+const byte OUTPUT_DISPLAY = 12; // cur red light
+const byte OUTPUT_PROJECTOR = 11; // cur green light
+// relay for projector power supply
+const byte OUTPUT_RELAY = 9;
+// some useful cmds from the projector protocol
 const String GET_POWER_STATUS = "*pow=?#";
 const String SET_POWER_OFF = "*pow=off#";
 const String SET_POWER_ON = "*pow=on#";
+const String GET_ERROR_STATUS = "*error=report#";
+const String GET_ERROR_ENABLE = "*error=enable#";
+const String GET_LED_STATUS = "*led=?#";
 //globals
 byte cur_state;
 byte new_state;
 byte transition_status;
-String incMsg;
+String inc_msg;
+bool print_debug;
+byte com_retry;
 
+
+/* 3 way switch: turn on small status display only or projector as well */
 byte getSwitchState() {
   if (digitalRead(INPUT_I) == LOW) {
     return STATE_OFF;
   } else if (digitalRead(INPUT_II) == LOW) {
-    return STATE_BEAMER;
+    return STATE_PROJECTOR;
   } else {
     return STATE_DISPLAY;
   }
 }
 
+
+/* send command to projector via rs232 */
 String sendCmd( const String cmd ) {
-  Sprintln("CMD:");
+  Sprint("CMD: ");
   Sprintln(cmd);
 
-  String tmpMsg = "";
-  // while (true) {
-  //   // empty input buffer
-  //   while(beamSerial.available()) {
-  //     beamSerial.read();
-  //   }
-  //   beamSerial.write(0x0D);
-  //   beamSerial.write(cmd.c_str());
-  //   beamSerial.write(0x0D);
-  //   beamSerial.flush(); // wait for send
+  String tmp_msg = "";
+  while (true) {
+    // empty input buffer
+    while(projector_serial.available()) {
+      projector_serial.read();
+    }
+    projector_serial.write(0x0D);
+    projector_serial.write(cmd.c_str());
+    projector_serial.write(0x0D);
+    projector_serial.flush(); // wait for send
 
-  //   // discard echo
-  //   tmpMsg = beamSerial.readStringUntil('\n');
-  //   // read second part
-  //   tmpMsg = beamSerial.readStringUntil('\n');
-  //   tmpMsg.trim();
-  //   if (tmpMsg != "") {
-  //     Sprintln("ANSWER:");
-  //     Sprintln(tmpMsg);
-  //     return tmpMsg;
-  //   } else {
-  //     Sprintln("ERROR - empty message, retrying communication");
-  //     delay(10);
-  //   }
-  // }
-  return tmpMsg;
+    // discard echo
+    tmp_msg = projector_serial.readStringUntil('\n');
+    // read second part
+    tmp_msg = projector_serial.readStringUntil('\n');
+    tmp_msg.trim();
+
+    if (tmp_msg != "") {
+      Sprint("ANSWER: ");
+      Sprintln(tmp_msg);
+      com_retry = 0;
+      return tmp_msg;
+    } else {
+      // under some conditions commands may fail
+      // even if connections, baud rate etc are all setup fine
+      // just retry a couple of times, if that doesn't work
+      // the projector decided to err out but won't tell (yet)
+      if (com_retry < 10) {
+        Sprintln("ERROR - empty message, retrying communication");
+        com_retry = com_retry + 1;
+        delay(200);        
+      } else {
+        Sprintln("retried 10 times, communication failed:");
+        com_retry = 0;
+        return "";
+      }
+    }
+  }
 }
 
+
 #ifdef DEBUG
+
+  /* Interrupt service handler: just toggle flag and write debug output in main loop */
   void debugISR(){
-    if((long)(micros() - lastPressed) >= debouncingTime * 1000) {
-      Sprintln("DEBUG STATE:");
-      Sprint("T-STAT:");
-      Sprintln(transition_status);
-      Sprint("C-STAT:");
-      Sprintln(cur_state);
-      Sprint("N-STAT:");
-      Sprintln(getSwitchState());
-      lastPressed = micros();
+    if((long)(micros() - last_keypress) >= debouncing_time * 1000) { 
+      print_debug = true;
+      last_keypress = micros();
     }
+  }
+
+  /* prints some projector state info for debug */
+  void printDebug(){
+    Sprintln("DEBUG STATE:");
+    inc_msg = sendCmd(GET_POWER_STATUS);
+    Sprintln("GET_POWER_STATUS");
+    Sprintln(inc_msg);
+    inc_msg = sendCmd(GET_ERROR_ENABLE);
+    inc_msg = sendCmd(GET_ERROR_STATUS);
+    Sprintln("GET_ERROR_STATUS");
+    Sprintln(inc_msg);
+    inc_msg = sendCmd(GET_LED_STATUS);
+    Sprintln("GET_LED_STATUS");
+    Sprintln(inc_msg);
+    inc_msg = sendCmd(SET_POWER_ON);
+    Sprintln("SET_POWER_ON");
+    Sprintln(inc_msg);
+    inc_msg = sendCmd(SET_POWER_OFF);
+    Sprintln("SET_POWER_OFF");
+    Sprintln(inc_msg);
+    
+    print_debug = false;
   }
 #endif
 
-bool checkBootStatus(bool powerOn) {
-  // if (powerOn) {
-  //   incMsg = sendCmd(GET_POWER_STATUS);
-  //   if (incMsg == "*POW=ON#"){
-  //     return true;
-  //   } else {
-  //     return false;
-  //   }
-  // } else {
-  //   // while shutting down, the beamer already returns *POW=OFF# status
-  //   // so check the answer to another power off cmd instead
-  //   incMsg = sendCmd(SET_POWER_OFF);
-  //   if (incMsg == "*Block item#"){
-  //     return false;
-  //   } else {
-  //     return true;
-  //   }   
-  // }
-  return true;
-}
 
+/* startup sequence for projector:
+   - uses relay to supply power to projector
+   - if startup fails power is cut and the whole sequence is restarted
+   - might take a while until the projector starts successfully
+     (takes up to ten minutes with my borked TH683 from 2018)
+*/
 void setPowerOn(){
-  bool booted = checkBootStatus(true);
-  if (booted) {
+  // connect power if currently not connected
+  if (digitalRead(OUTPUT_RELAY)){
+    Sprintln("Projector: turn power on!");
+    digitalWrite(OUTPUT_RELAY, LOW);
+    // wait a bit until projector boots up
+    delay(5000);
+    // then tell it to turn on
+    sendCmd(SET_POWER_ON);
+    delay(5000);
+  }
+  // check if already powered on (takes ~20seconds)
+  inc_msg = sendCmd(GET_POWER_STATUS);
+  if (inc_msg == "*POW=ON#"){
+    // if answer to GET_POWER_STATUS is *POW=ON# everything is fine!
     Sprintln("State: Powered On!");
+    digitalWrite(OUTPUT_DISPLAY, HIGH);
+    digitalWrite(OUTPUT_PROJECTOR, HIGH);
     transition_status = TRANS_NONE;
   } else {
-    sendCmd(SET_POWER_ON);
-    transition_status = TRANS_BEAMER;
+    // periodically check if still starting up or startup failed
+    inc_msg = sendCmd(SET_POWER_ON);
+    if (inc_msg == "*Block item#"){
+      Sprintln("Projector: turn power on blocked!");
+      // keep waiting
+      delay(200);
+    } else if (inc_msg != "") {
+      // if SET_POWER_ON returns anything other than *Block item there is a problem
+      Sprintln("Projector: FAILED to startup !");
+      // -> disconnect power, wait 60 seconds and try again
+      digitalWrite(OUTPUT_RELAY, HIGH);
+      delay(60000);
+    }
+    transition_status = TRANS_PROJECTOR;
   }
 }
 
+
+/* initialize shutdown sequence */
 void setPowerOff(){
-  // while (true) {
-  //   incMsg = sendCmd(SET_POWER_OFF);
-  //   if (incMsg == "Illegal format") {
-  //     // already off, do nothing
-  //     transition_status = TRANS_OFF;
-  //     break;
-  //   } else if (incMsg == "*POW=OFF#") {
-  //     // shutdown started
-  //     transition_status = TRANS_OFF;
-  //     break;
-  //   } else {
-  //     // blocked or already in transition -> retry
-  //     // after startup, beamer needs a while to be ready to shutdown again
-  //     delay(50);
-  //   }
-  // }
-  incMsg = "";
-  // digitalWrite(OUTPUT_BEAMER, LOW);
+  // only need to init shutdown/disconnect if projector currently gets power
+  if (!digitalRead(OUTPUT_RELAY)) {
+    while (true) {
+      inc_msg = sendCmd(SET_POWER_OFF);
+      if (inc_msg == "Illegal format") {
+        // already off, do nothing
+        transition_status = TRANS_OFF;
+        break;
+      } else if (inc_msg == "*POW=OFF#") {
+        // shutdown started
+        transition_status = TRANS_OFF;
+        break;
+      } else {
+        // blocked or already in transition -> retry
+        // after startup, projector needs a while to be ready to shutdown again
+        delay(500);
+      }
+    }
+  }
 }
 
+
+/* setup input/output pins and serial connection */
 void setup() {
   #ifdef DEBUG
     //start serial connection
@@ -164,45 +224,49 @@ void setup() {
     pinMode(INPUT_DBG, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(INPUT_DBG), debugISR, LOW);
   #endif
-  // serial port to beamer
-  // beamSerial.begin(9600);
+  // serial port to projector
+  projector_serial.begin(9600);
   //configure input-pins and enable the internal pull-up resistor
   pinMode(INPUT_I, INPUT_PULLUP);
   pinMode(INPUT_II, INPUT_PULLUP);
   // outputs
   pinMode(OUTPUT_DISPLAY, OUTPUT);
-  pinMode(OUTPUT_BEAMER, OUTPUT);
+  pinMode(OUTPUT_PROJECTOR, OUTPUT);
+  pinMode(OUTPUT_RELAY, OUTPUT);
   //initial state
   cur_state = STATE_OFF;
   digitalWrite(OUTPUT_DISPLAY, LOW);
-  digitalWrite(OUTPUT_BEAMER, LOW);
+  digitalWrite(OUTPUT_PROJECTOR, LOW);
+  digitalWrite(OUTPUT_RELAY, HIGH); // normally open relay, low trigger
   transition_status = TRANS_NONE;
+
+  com_retry = 0;
+  print_debug = false;
 }
 
-// OUTPUT_MOTOR: an wenn [power off]
-// OUTPUT_LIGHT: an wenn [power on]
-// power an -> trans pon -> solange bis getPowerStatus == *POW=ON#
-// power off -> trans poff -> solange bis setPowerOff == Illegal format
 
+/* main loop */
 void loop() {
   if (transition_status == TRANS_NONE) {
-    // no current transtion: read the input pins to detect state change
+    // no current transtion: read the input pins to detect state changes
     new_state = getSwitchState();
     if (new_state != cur_state) {
-      Sprintln("State has changed: ");
+      Sprint("State has changed: ");
+      Sprintln(new_state);
       switch (new_state) {
         case STATE_OFF:
           digitalWrite(OUTPUT_DISPLAY, LOW);
-          digitalWrite(OUTPUT_BEAMER, LOW);
+          digitalWrite(OUTPUT_PROJECTOR, LOW);
+          setPowerOff();
           break;
         case STATE_DISPLAY:
           digitalWrite(OUTPUT_DISPLAY, HIGH);
-          digitalWrite(OUTPUT_BEAMER, LOW);
+          digitalWrite(OUTPUT_PROJECTOR, LOW);
           setPowerOff();
           break;
-        case STATE_BEAMER:
+        case STATE_PROJECTOR:
           digitalWrite(OUTPUT_DISPLAY, HIGH);
-          digitalWrite(OUTPUT_BEAMER, HIGH);
+          // OUTPUT_PROJECTOR will turn on only AFTER the projector has booted
           setPowerOn();
           break;
       }
@@ -211,14 +275,30 @@ void loop() {
   } else {
     switch (transition_status) {
       case TRANS_OFF:
-        if (checkBootStatus(false)) {//turned off?
-          Sprintln("State: TURNED OFF!");
+        // while shutting down, the projector already returns *POW=OFF# status
+        // so check the answer to another power off cmd instead
+        inc_msg = sendCmd(SET_POWER_OFF);
+        // block item means currently shutting down, also ignore empty responses
+        if (inc_msg != "" && inc_msg != "*Block item#") {
+          Sprintln("Projector: turned off!");
           transition_status = TRANS_NONE;
+          // disconnect power to projector if currently connected
+          if (!digitalRead(OUTPUT_RELAY)){
+            delay(2000);
+            digitalWrite(OUTPUT_RELAY, HIGH);
+            Sprintln("Projector: power disconnected");
+            delay(20000);
+          }
         }
         break;
-      case TRANS_BEAMER:
+      case TRANS_PROJECTOR:
         setPowerOn(); break;
     }
   }
+  #ifdef DEBUG
+    if (print_debug) {
+      printDebug();
+    }
+  #endif
   delay(500);        // delay in between reads for stability
 }
